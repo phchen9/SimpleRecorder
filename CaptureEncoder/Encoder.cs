@@ -5,6 +5,8 @@ using Windows.Foundation;
 using Windows.Graphics;
 using Windows.Graphics.Capture;
 using Windows.Graphics.DirectX.Direct3D11;
+using Windows.Media.Capture;
+using Windows.Media.Capture.Frames;
 using Windows.Media.Core;
 using Windows.Media.MediaProperties;
 using Windows.Media.Transcoding;
@@ -37,6 +39,9 @@ namespace CaptureEncoder
             {
                 _isRecording = true;
 
+                // Initialize audio capture
+                await InitializeAudioCaptureAsync();
+
                 _frameGenerator = new CaptureFrameWait(
                     _device,
                     _captureItem,
@@ -55,7 +60,15 @@ namespace CaptureEncoder
                     encodingProfile.Video.FrameRate.Denominator = 1;
                     encodingProfile.Video.PixelAspectRatio.Numerator = 1;
                     encodingProfile.Video.PixelAspectRatio.Denominator = 1;
+
+                    encodingProfile.Audio = AudioEncodingProperties.CreateAac(48000, 2, 192000);
+
                     var transcode = await _transcoder.PrepareMediaStreamSourceTranscodeAsync(_mediaStreamSource, stream, encodingProfile);
+                    if (!transcode.CanTranscode)
+                    {
+                        Debug.WriteLine("Failed to prepare transcode: " + transcode.FailureReason);
+                        return;
+                    }
 
                     await transcode.TranscodeAsync();
                 }
@@ -111,15 +124,21 @@ namespace CaptureEncoder
             var videoProperties = VideoEncodingProperties.CreateUncompressed(MediaEncodingSubtypes.Bgra8, (uint)width, (uint)height);
             _videoDescriptor = new VideoStreamDescriptor(videoProperties);
 
+            // Create audio descriptor
+            var audioProperties = AudioEncodingProperties.CreateAac(48000, 2, 192000);
+            _audioDescriptor = new AudioStreamDescriptor(audioProperties);
+
             // Create our MediaStreamSource
             _mediaStreamSource = new MediaStreamSource(_videoDescriptor);
             _mediaStreamSource.BufferTime = TimeSpan.FromSeconds(0);
             _mediaStreamSource.Starting += OnMediaStreamSourceStarting;
             _mediaStreamSource.SampleRequested += OnMediaStreamSourceSampleRequested;
 
+            _mediaStreamSource.AddStreamDescriptor(_audioDescriptor);
+
             // Create our transcoder
             _transcoder = new MediaTranscoder();
-            _transcoder.HardwareAccelerationEnabled = true;
+            _transcoder.HardwareAccelerationEnabled = false;//true;
         }
 
         private void OnMediaStreamSourceSampleRequested(MediaStreamSource sender, MediaStreamSourceSampleRequestedEventArgs args)
@@ -128,26 +147,36 @@ namespace CaptureEncoder
             {
                 try
                 {
-                    using (var frame = _frameGenerator.WaitForNewFrame())
+                    if (args.Request.StreamDescriptor is VideoStreamDescriptor)
                     {
-                        if (frame == null)
+                        using (var frame = _frameGenerator.WaitForNewFrame())
                         {
-                            args.Request.Sample = null;
-                            DisposeInternal();
-                            return;
-                        }
-
-                        if (_isPreviewing)
-                        {
-                            lock (_previewLock)
+                            if (frame == null)
                             {
-                                _preview.PresentSurface(frame.Surface);
+                                args.Request.Sample = null;
+                                DisposeInternal();
+                                return;
                             }
-                        }
 
-                        var timeStamp = frame.SystemRelativeTime;
-                        var sample = MediaStreamSample.CreateFromDirect3D11Surface(frame.Surface, timeStamp);
-                        args.Request.Sample = sample;
+                            if (_isPreviewing)
+                            {
+                                lock (_previewLock)
+                                {
+                                    _preview.PresentSurface(frame.Surface);
+                                }
+                            }
+
+                            var timeStamp = frame.SystemRelativeTime;
+                            var sample = MediaStreamSample.CreateFromDirect3D11Surface(frame.Surface, timeStamp);
+                            args.Request.Sample = sample;
+                        }
+                    }
+                    else if (args.Request.StreamDescriptor is AudioStreamDescriptor)
+                    {
+                        // Handle audio sample request
+                        Debug.WriteLine("Try to get audio sample");
+                        //var audioSample = await GetNextAudioSampleAsync();
+                        //args.Request.Sample = audioSample;
                     }
                 }
                 catch (Exception e)
@@ -173,6 +202,22 @@ namespace CaptureEncoder
                 args.Request.SetActualStartPosition(frame.SystemRelativeTime);
             }
         }
+
+        public IAsyncAction InitializeAudioCaptureAsync()
+        {
+            return InitializeAudioCaptureAsyncImpl().AsAsyncAction();
+        }
+
+        private async Task InitializeAudioCaptureAsyncImpl()
+        {
+            _audioCapture = new MediaCapture();
+            var settings = new MediaCaptureInitializationSettings
+            {
+                StreamingCaptureMode = StreamingCaptureMode.Audio
+            };
+            await _audioCapture.InitializeAsync(settings);
+        }
+
 
         private class EncoderPreview : IDisposable
         {
@@ -271,6 +316,9 @@ namespace CaptureEncoder
         private bool _isPreviewing = false;
         private object _previewLock;
         private EncoderPreview _preview;
+
+        private MediaCapture _audioCapture;
+        private AudioStreamDescriptor _audioDescriptor;
 
         private bool _closed = false;
     }
